@@ -10,30 +10,38 @@
 
 DELETE FROM comment_events WHERE comment_id LIKE 'demo-%';
 DELETE FROM message_events WHERE message_id LIKE 'demo-%';
-DELETE FROM rules WHERE id IN (101, 102, 103, 104);
+DELETE FROM rules WHERE id IN (101, 102, 103, 104, 105);
 
-INSERT INTO rules (id, label, keywords, reply_text, public_reply_text, link_url, link_button_label, active, created_at, updated_at)
+-- Automations choose where they listen: comments, DMs and story replies.
+INSERT INTO rules (id, label, channels, keywords, reply_text, public_reply_text, link_url, link_button_label, active, created_at, updated_at)
 VALUES
-  (101, 'Free photo guide', '["GUIDE","guidebook"]',
+  (101, 'Free photo guide', '["comments","dms"]', '["GUIDE","guidebook"]',
    'Thanks for commenting! Here is the free beginner photo guide.',
-   'Sent it to your DMs!' || char(10) || 'Check your DMs.' || char(10) || 'Just sent it over!',
+   'Sent you the link' || char(10) || 'Check your DMs' || char(10) || 'Just sent it over',
    'https://example.com/guide', 'Get the guide', 1,
    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-30 days'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-30 days')),
-  (102, 'Lightroom presets', '["PRESET","presets"]',
+  (102, 'Lightroom presets', '["comments","dms"]', '["PRESET","presets"]',
    'Here are the free Lightroom presets from today''s post. Enjoy!',
-   'Presets are in your DMs!' || char(10) || 'Sent!',
+   'Dropped it in your DMs' || char(10) || 'On it, check your DMs',
    'https://example.com/presets', 'Get presets', 1,
    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-21 days'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-21 days')),
-  (103, 'Workshop waitlist', '["WORKSHOP"]',
+  (103, 'Workshop waitlist', '["comments"]', '["WORKSHOP"]',
    'The next workshop opens soon. Join the waitlist to hear about it first.',
-   'Check your DMs for the waitlist link.',
+   'Check your DMs',
    'https://example.com/workshop', 'Join waitlist', 1,
    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-14 days'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-14 days')),
-  (104, 'Podcast episode', '["PODCAST"]',
+  (104, 'Podcast episode', '["comments"]', '["PODCAST"]',
    'Here is the full episode: https://example.com/podcast',
    NULL, NULL, NULL, 0,
-   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days'));
+   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')),
+  (105, 'Photo walk sign-up', '["dms","stories"]', '["WALK"]',
+   'Here are the details for Saturday''s photo walk. Spots are limited!',
+   NULL, 'https://example.com/photo-walk', 'Save my spot', 1,
+   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 days'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 days'));
 
+-- Comments. demo-c9 and demo-c10 mention a keyword in passing, so the strict
+-- matching rule ignores them. demo-c11 is an older send from before that rule,
+-- where GUIDE matched inside "guidelines"; Sent DMs flags it.
 INSERT INTO comment_events
   (comment_id, media_id, username, comment_text, matched, status, error, matched_rule_id, matched_keyword, rule_label, received_at, sent_at)
 VALUES
@@ -51,37 +59,55 @@ VALUES
    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 hours'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 hours')),
   ('demo-c7', 'demo-media-1', 'demo_reader_7', 'guide pls', 1, 'send_error', 'Meta API 400: the comment is too old for a private reply (demo)', 101, 'GUIDE', 'Free photo guide',
    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 days'), NULL),
-  ('demo-c8', 'demo-media-3', 'demo_reader_8', 'Signing up for the WORKSHOP', 1, 'dry_run_matched', NULL, 103, 'WORKSHOP', 'Workshop waitlist',
-   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 days'), NULL);
+  ('demo-c8', 'demo-media-3', 'demo_reader_8', 'workshop 🙌', 1, 'dry_run_matched', NULL, 103, 'WORKSHOP', 'Workshop waitlist',
+   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 days'), NULL),
+  ('demo-c9', 'demo-media-1', 'demo_reader_14', 'I loved your guide last week, it helped so much', 0, 'ignored_no_keyword', NULL, NULL, NULL, NULL,
+   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-4 hours'), NULL),
+  ('demo-c10', 'demo-media-2', 'demo_reader_15', '@demo.creator what camera do you use with those presets?', 0, 'ignored_no_keyword', NULL, NULL, NULL, NULL,
+   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-6 hours'), NULL),
+  ('demo-c11', 'demo-media-1', 'demo_reader_16', 'These guidelines are gold', 1, 'sent', NULL, 101, 'GUIDE', 'Free photo guide',
+   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-4 days'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-4 days'));
 
+-- DMs: a starter tap, a story rule, a DM link, a typed keyword, a story reply
+-- answered by an automation that listens on story replies, a failed send, and
+-- messages that don't match.
 INSERT INTO message_events
   (message_id, sender_id, recipient_id, message_text, quick_reply_payload, source, story_id, story_url, story_link_url, referral_ref,
-   reply_key, matched_choice, status, sender_username, is_follower, profile_checked_at, received_at, sent_at)
+   reply_key, matched_choice, status, error, sender_username, is_follower, profile_checked_at, received_at, sent_at)
 VALUES
   ('demo-m1', 'demo-000001', 'demo-account', 'Get the free guide', 'DM_REPLY__rule-101', 'starter', NULL, NULL, NULL, NULL,
-   'rule-101', 'Free photo guide', 'sent', 'demo_reader_9', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-20 minutes'),
+   'rule-101', 'Free photo guide', 'sent', NULL, 'demo_reader_9', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-20 minutes'),
    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-20 minutes'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-20 minutes')),
   ('demo-m2', 'demo-000002', 'demo-account', 'When is the next one?', NULL, 'story_reply', '1234567890', NULL, NULL, NULL,
-   'rule-103', 'Workshop waitlist', 'sent', 'demo_reader_10', 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-50 minutes'),
+   'rule-103', 'Workshop waitlist', 'sent', NULL, 'demo_reader_10', 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-50 minutes'),
    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-50 minutes'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-50 minutes')),
   ('demo-m3', 'demo-000003', 'demo-account', '', NULL, 'referral', NULL, NULL, NULL, 'rule-102__newsletter',
-   'rule-102', 'Lightroom presets', 'sent', NULL, NULL, NULL,
+   'rule-102', 'Lightroom presets', 'sent', NULL, NULL, NULL, NULL,
    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours')),
   ('demo-m4', 'demo-000004', 'demo-account', 'Do you teach in-person classes?', NULL, 'dm', NULL, NULL, NULL, NULL,
-   NULL, NULL, 'ignored_no_match', 'demo_reader_11', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-4 hours'),
+   NULL, NULL, 'ignored_no_match', NULL, 'demo_reader_11', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-4 hours'),
    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-4 hours'), NULL),
   ('demo-m5', 'demo-000005', 'demo-account', 'Ask a question', 'DM_REPLY__text-ask', 'starter', NULL, NULL, NULL, NULL,
-   'text-ask', 'Ask a question', 'sent', 'demo_reader_12', 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-6 hours'),
+   'text-ask', 'Ask a question', 'sent', NULL, 'demo_reader_12', 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-6 hours'),
    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-6 hours'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-6 hours')),
   ('demo-m6', 'demo-000006', 'demo-account', 'presets please', NULL, 'dm', NULL, NULL, NULL, NULL,
-   'rule-102', 'Lightroom presets', 'sent', 'demo_reader_13', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-9 hours'),
-   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-9 hours'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-9 hours'));
+   'rule-102', 'Lightroom presets', 'sent', NULL, 'demo_reader_13', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-9 hours'),
+   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-9 hours'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-9 hours')),
+  ('demo-m7', 'demo-000007', 'demo-account', 'WALK 🙋', NULL, 'story_reply', '2345678901', NULL, NULL, NULL,
+   'rule-105', 'Photo walk sign-up', 'sent', NULL, 'demo_reader_17', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-25 minutes'),
+   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-25 minutes'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-25 minutes')),
+  ('demo-m8', 'demo-000008', 'demo-account', 'walk please', NULL, 'dm', NULL, NULL, NULL, NULL,
+   'rule-105', 'Photo walk sign-up', 'send_error', 'Meta API 400: this person cannot receive messages right now (demo)', 'demo_reader_18', 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 hours'),
+   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 hours'), NULL),
+  ('demo-m9', 'demo-000009', 'demo-account', 'Your guide got me shooting again. Is there a part two?', NULL, 'dm', NULL, NULL, NULL, NULL,
+   NULL, NULL, 'ignored_no_match', NULL, 'demo_reader_19', 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 hours'),
+   strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 hours'), NULL);
 
 -- Starters, custom replies and story rules that point at the demo rules.
 INSERT INTO automation_settings (key, value, updated_at)
 VALUES (
   'dm_features',
-  '{"revision":"demo","startersEnabled":true,"starters":[{"title":"Get the free guide","reply":"rule-101"},{"title":"Download the presets","reply":"rule-102"},{"title":"Join the workshop waitlist","reply":"rule-103"},{"title":"Ask a question","reply":"text-ask"}],"followerCheckEnabled":true,"followerReply":"Thanks for following!","nonFollowerReply":"Thanks for stopping by!","keywordRepliesEnabled":true,"customReplies":[{"id":"ask","label":"Ask a question","text":"Thanks for reaching out! Send your question here and I will reply as soon as I can."},{"id":"collab","label":"Collaborations","text":"For collaborations, email hello@example.com with a short note about your project."}],"storyRules":[{"id":"demo-story-workshop","label":"Workshop announcement","storyId":"1234567890","storyUrl":"","keyword":"","reply":"rule-103","enabled":true},{"id":"demo-story-guide","label":"Any story reply with GUIDE","storyId":"","storyUrl":"","keyword":"GUIDE","reply":"rule-101","enabled":true},{"id":"demo-story-presets","label":"Presets link sticker","storyId":"","storyUrl":"https://example.com/presets","keyword":"","reply":"rule-102","enabled":false}]}',
+  '{"revision":"demo","startersEnabled":true,"starters":[{"title":"Get the free guide","reply":"rule-101"},{"title":"Download the presets","reply":"rule-102"},{"title":"Join the workshop waitlist","reply":"rule-103"},{"title":"Ask a question","reply":"text-ask"}],"followerCheckEnabled":true,"followerReply":"Thanks for following!","nonFollowerReply":"Thanks for stopping by!","customReplies":[{"id":"ask","label":"Ask a question","text":"Thanks for reaching out! Send your question here and I will reply as soon as I can."},{"id":"collab","label":"Collaborations","text":"For collaborations, email hello@example.com with a short note about your project."}],"storyRules":[{"id":"demo-story-workshop","label":"Workshop announcement","storyId":"1234567890","storyUrl":"","keyword":"","reply":"rule-103","enabled":true},{"id":"demo-story-guide","label":"Any story reply with GUIDE","storyId":"","storyUrl":"","keyword":"GUIDE","reply":"rule-101","enabled":true},{"id":"demo-story-presets","label":"Presets link sticker","storyId":"","storyUrl":"https://example.com/presets","keyword":"","reply":"rule-102","enabled":false}]}',
   strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 )
 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;

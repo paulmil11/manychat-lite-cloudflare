@@ -86,7 +86,10 @@ test("the KEYWORD fallback from wrangler.jsonc replies when no dashboard rule ma
   // The migration's example rule uses "guide" but starts switched off.
   assert.equal(h.query("SELECT active FROM rules WHERE label = 'Example lead magnet'").active, 0);
   h.setResponder(() => new Response(JSON.stringify({ error: { message: "temporary" } }), { status: 503 }));
-  await h.webhook(commentPayload("fallback-comment", "Is there a guide?"));
+  // The fallback uses the same strict matching as dashboard rules.
+  await h.webhook(commentPayload("fallback-question", "Is there a guide for beginners?"));
+  assert.equal(eventRow(h, "fallback-question").status, "ignored_no_keyword");
+  await h.webhook(commentPayload("fallback-comment", "guide please?"));
   assert.deepEqual(privateCalls(h)[0].body.message, { text: "A fallback reply" });
   const failed = eventRow(h, "fallback-comment");
   assert.equal(failed.status, "send_error");
@@ -244,6 +247,8 @@ test("rule validation enforces Instagram message limits and complete link button
     { reply_text: "x".repeat(641) },
     { link_url: "", link_button_label: "", reply_text: "x".repeat(1001) },
     { public_reply_text: "x".repeat(2201) },
+    { channels: "everywhere" },
+    { keywords: "@yourhandle" },
   ];
   for (const fields of invalid) {
     const response = await h.postForm("/admin/rules", { ...GUIDE_RULE, label: "Invalid", active: "on", ...fields }, cookie);
@@ -251,7 +256,7 @@ test("rule validation enforces Instagram message limits and complete link button
   }
   assert.equal(count(), before);
   await createRule(h, cookie, { ...GUIDE_RULE, reply_text: "x".repeat(640) });
-  await createRule(h, cookie, { ...GUIDE_RULE, label: "Plain text", link_url: "", link_button_label: "", reply_text: "y".repeat(1000) });
+  await createRule(h, cookie, { ...GUIDE_RULE, label: "Plain text", keywords: "PLAIN", link_url: "", link_button_label: "", reply_text: "y".repeat(1000) });
   assert.equal(count(), before + 2);
   assert.equal(h.calls.length, 0);
 });
@@ -260,7 +265,7 @@ test("admin routes require a session and reject cross-site writes", async (t) =>
   const h = await fixture(t);
   const login = await h.request("/admin");
   assert.equal(login.status, 200);
-  assert.match(await login.text(), /Admin Login/);
+  assert.match(await login.text(), /<h1>Sign in<\/h1>[\s\S]*name="token"/);
   const wrongPassword = await h.postForm("/admin/login", { token: "wrong" });
   assert.equal(wrongPassword.headers.get("location"), "/admin?error=1");
   const before = h.query("SELECT COUNT(*) AS count FROM rules").count;

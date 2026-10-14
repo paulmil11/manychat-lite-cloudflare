@@ -1,8 +1,13 @@
 // Shapes shared by the Worker and the dashboard renderer.
 
+// Where a keyword automation listens: comments on your posts, DMs, and replies to your stories.
+export type Channel = "comments" | "dms" | "stories";
+export const CHANNELS: readonly Channel[] = ["comments", "dms", "stories"];
+
 export type Rule = {
   id: number;
   label: string;
+  channels: Channel[];
   keywords: string[];
   replyText: string;
   publicReplyText: string | null;

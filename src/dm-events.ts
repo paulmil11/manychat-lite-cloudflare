@@ -1,4 +1,5 @@
 import { parseReplyPayload, type StoryRule } from "./dm-features";
+import { isBasicallyKeyword } from "./keyword-match";
 
 // Parses the Instagram messaging webhooks (messages, messaging_postbacks and
 // messaging_referral) into one event shape.
@@ -105,14 +106,6 @@ async function parseDmEvent(input: unknown, entryId: string | null): Promise<DmE
   return { messageId, senderId, recipientId, text, quickReplyPayload, timestamp, kind, source, storyId, storyUrl, storyLinkUrl, referralRef };
 }
 
-/** Case-insensitive whole-word match: "guide!" matches GUIDE, "guidebook" does not. */
-export function matchesWholeWord(text: string, keyword: string): boolean {
-  const trimmed = keyword.trim();
-  if (!trimmed) return false;
-  const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?:^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`, "iu").test(text);
-}
-
 export function matchStoryRule(event: DmEvent, rules: StoryRule[]): StoryRule | null {
   if (event.source !== "story_reply" && event.source !== "story_mention") return null;
   // A specific story wins over a keyword applying to every story. Paused matching
@@ -122,7 +115,8 @@ export function matchStoryRule(event: DmEvent, rules: StoryRule[]): StoryRule | 
     if (!rule.storyId && !rule.storyUrl && !rule.keyword) continue;
     if (rule.storyId && rule.storyId !== event.storyId) continue;
     if (rule.storyUrl && ![event.storyUrl, event.storyLinkUrl].includes(httpsUrl(rule.storyUrl))) continue;
-    if (rule.keyword && !matchesWholeWord(event.text, rule.keyword)) continue;
+    // Story rule keywords follow the same rule as automations (src/keyword-match.ts).
+    if (rule.keyword && !isBasicallyKeyword(event.text, rule.keyword)) continue;
     return rule;
   }
   return null;

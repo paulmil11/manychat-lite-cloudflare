@@ -35,7 +35,6 @@ function featureForm(settings) {
   const form = new FormData();
   if (settings.startersEnabled) form.set("starters_enabled", "on");
   if (settings.followerCheckEnabled) form.set("follower_check_enabled", "on");
-  if (settings.keywordRepliesEnabled) form.set("keyword_replies_enabled", "on");
   form.set("follower_reply", settings.followerReply);
   form.set("non_follower_reply", settings.nonFollowerReply);
   for (const starter of settings.starters) {
@@ -74,7 +73,6 @@ test("the migration seeds generic defaults that keep every DM tool off", async (
   assert.equal(settings.startersEnabled, false);
   assert.deepEqual(settings.starters, []);
   assert.equal(settings.followerCheckEnabled, false);
-  assert.equal(settings.keywordRepliesEnabled, false);
   assert.deepEqual(settings.storyRules, []);
   assert.equal(settings.customReplies.length, 1);
   assert.equal(h.query("SELECT COUNT(*) AS count FROM rules").count, 1, "Only the starter's switched-off example rule exists");
@@ -87,7 +85,9 @@ test("the settings form checks starter replies and keeps story rules and custom 
   const existing = await features.getDmFeatureSettings(h.db);
   existing.storyRules = [{ id: "story-1", label: "Any guide reply", storyId: "", storyUrl: "", keyword: "GUIDE", reply: "rule-1", enabled: true }];
   const ruleIds = new Set([1]);
-  const form = featureForm({ ...existing, startersEnabled: true, starters: STARTERS, keywordRepliesEnabled: true });
+  const form = featureForm({ ...existing, startersEnabled: true, starters: STARTERS });
+  // The DM keyword switch moved to each automation's channels; an old form field is ignored.
+  form.set("keyword_replies_enabled", "on");
   form.set("story_rules", "[]");
   form.set("custom_replies", "[]");
   form.append("starter_title", "");
@@ -95,7 +95,7 @@ test("the settings form checks starter replies and keeps story rules and custom 
   const parsed = features.parseDmFeaturesForm(form, existing, ruleIds);
   assert.equal(parsed.ok, true, parsed.error);
   assert.deepEqual(parsed.settings.starters, STARTERS);
-  assert.equal(parsed.settings.keywordRepliesEnabled, true);
+  assert.equal("keywordRepliesEnabled" in parsed.settings, false);
   assert.deepEqual(parsed.settings.storyRules, existing.storyRules);
   assert.deepEqual(parsed.settings.customReplies, existing.customReplies);
   await features.saveDmFeatureSettings(h.db, parsed.settings);
@@ -346,6 +346,17 @@ test("corrupted saved configuration disables DM tools until settings are repaire
   const settings = await features.getDmFeatureSettings(h.db);
   assert.equal(settings.startersEnabled, false);
   assert.equal(settings.followerCheckEnabled, false);
-  assert.equal(settings.keywordRepliesEnabled, false);
   assert.deepEqual(settings.storyRules, []);
+});
+
+test("settings saved before migration 0008 still load, without the old DM keyword switch", async (t) => {
+  const h = await fixture(t);
+  const stored = JSON.parse(h.query("SELECT value FROM automation_settings WHERE key = 'dm_features'").value);
+  assert.equal(stored.keywordRepliesEnabled, false, "The 0007 seed still holds the old field");
+  await h.db.prepare("UPDATE automation_settings SET value = json_set(value, '$.keywordRepliesEnabled', json('true'), '$.followerCheckEnabled', json('true')) WHERE key = 'dm_features'").run();
+  const settings = await features.getDmFeatureSettings(h.db);
+  assert.equal(settings.followerCheckEnabled, true);
+  assert.equal("keywordRepliesEnabled" in settings, false);
+  await features.saveDmFeatureSettings(h.db, settings);
+  assert.equal("keywordRepliesEnabled" in JSON.parse(h.query("SELECT value FROM automation_settings WHERE key = 'dm_features'").value), false);
 });

@@ -1,7 +1,8 @@
 import { getInstagramAccessToken } from "./instagram-token";
 
 // DM tools: conversation starters, story replies, links to specific replies and
-// follower checks. Each of them points at a reply key:
+// follower checks. Whether keyword automations answer DMs and story replies is
+// set per automation (rules.channels), not here. Each tool points at a reply key:
 //   rule-<id>  sends the DM text and link button of that keyword rule
 //   text-<id>  sends one of the custom text replies saved in DM tools
 export type ReplyKey = string;
@@ -24,7 +25,6 @@ export type DmFeatureSettings = {
   followerCheckEnabled: boolean;
   followerReply: string;
   nonFollowerReply: string;
-  keywordRepliesEnabled: boolean;
   customReplies: CustomReply[];
   storyRules: StoryRule[];
 };
@@ -78,7 +78,6 @@ export const DEFAULT_DM_FEATURE_SETTINGS: DmFeatureSettings = {
   followerCheckEnabled: false,
   followerReply: "",
   nonFollowerReply: "",
-  keywordRepliesEnabled: false,
   customReplies: [
     { id: "ask", label: "Ask a question", text: "Thanks for reaching out! Send your question here and I will reply as soon as I can." }
   ],
@@ -168,8 +167,7 @@ export function validateStoryRule(rule: StoryRule): string | null {
  */
 export function validateDmFeatureSettings(settings: DmFeatureSettings, ruleIds?: ReadonlySet<number>): string | null {
   if (!settings || typeof settings !== "object") return "DM settings are invalid.";
-  if (typeof settings.startersEnabled !== "boolean" || typeof settings.followerCheckEnabled !== "boolean" ||
-      typeof settings.keywordRepliesEnabled !== "boolean") return "Feature status is invalid.";
+  if (typeof settings.startersEnabled !== "boolean" || typeof settings.followerCheckEnabled !== "boolean") return "Feature status is invalid.";
   if (!Array.isArray(settings.customReplies) || settings.customReplies.length > MAX_CUSTOM_REPLIES) return `Use no more than ${MAX_CUSTOM_REPLIES} custom replies.`;
   const customIds = new Set<string>();
   for (const reply of settings.customReplies) {
@@ -203,7 +201,7 @@ function textField(form: FormData, key: string): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-/** Starters, follower checks and DM keyword replies. Story rules and custom replies have their own editors. */
+/** Starters and follower checks. Story rules and custom replies have their own editors. */
 export function parseDmFeaturesForm(form: FormData, existing: DmFeatureSettings, ruleIds: ReadonlySet<number>): Parsed<DmFeatureSettings> {
   const titles = form.getAll("starter_title");
   const replies = form.getAll("starter_reply");
@@ -221,7 +219,6 @@ export function parseDmFeaturesForm(form: FormData, existing: DmFeatureSettings,
     followerCheckEnabled: form.get("follower_check_enabled") === "on",
     followerReply: textField(form, "follower_reply"),
     nonFollowerReply: textField(form, "non_follower_reply"),
-    keywordRepliesEnabled: form.get("keyword_replies_enabled") === "on",
     // An old or partial settings form cannot erase the separately edited lists.
     customReplies: structuredClone(existing.customReplies),
     storyRules: structuredClone(existing.storyRules)
@@ -269,18 +266,19 @@ export async function getDmFeatureSettings(db: D1Database): Promise<DmFeatureSet
   try {
     const value: unknown = JSON.parse(row.value);
     if (value && typeof value === "object" && !validateDmFeatureSettings(value as DmFeatureSettings)) {
+      // Older settings may still hold keywordRepliesEnabled; migration 0008 moved it to rules.channels.
       const stored = value as DmFeatureSettings;
       return {
         startersEnabled: stored.startersEnabled, starters: stored.starters,
         followerCheckEnabled: stored.followerCheckEnabled, followerReply: stored.followerReply,
-        nonFollowerReply: stored.nonFollowerReply, keywordRepliesEnabled: stored.keywordRepliesEnabled,
+        nonFollowerReply: stored.nonFollowerReply,
         customReplies: stored.customReplies, storyRules: stored.storyRules
       };
     }
   } catch { /* Invalid saved settings must not activate a new reply. */ }
   return {
     ...structuredClone(DEFAULT_DM_FEATURE_SETTINGS),
-    startersEnabled: false, followerCheckEnabled: false, keywordRepliesEnabled: false, storyRules: []
+    startersEnabled: false, followerCheckEnabled: false, storyRules: []
   };
 }
 

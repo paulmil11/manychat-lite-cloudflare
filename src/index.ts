@@ -1,5 +1,5 @@
 import { renderDashboardPage, renderErrorPage, renderLoginPage, renderMissingAdminTokenPage } from "./dashboard";
-import { extractDmEvents, matchStoryRule, matchesWholeWord, type DmEvent } from "./dm-events";
+import { extractDmEvents, matchStoryRule, type DmEvent } from "./dm-events";
 import {
   customReplyKey,
   getDmFeatureSettings,
@@ -27,13 +27,17 @@ import {
   maintainInstagramAccessToken,
   type InstagramTokenStatus
 } from "./instagram-token";
-import type {
-  ActivityFilters,
-  DashboardStats,
-  RecentEventRow,
-  RecentMessageRow,
-  ReplyStatsRow,
-  Rule
+import { isBasicallyKeyword } from "./keyword-match";
+import { getSentDms, getSentDmSummary, renderSentDmsPage, renderSentRows, renderSentSummary } from "./sent-dms";
+import {
+  CHANNELS,
+  type ActivityFilters,
+  type Channel,
+  type DashboardStats,
+  type RecentEventRow,
+  type RecentMessageRow,
+  type ReplyStatsRow,
+  type Rule
 } from "./types";
 
 type SecretEnv = {
@@ -71,6 +75,7 @@ type CommentEvent = {
 type RuleRow = {
   id: number;
   label: string;
+  channels: string | null;
   keywords: string;
   reply_text: string;
   public_reply_text: string | null;
@@ -160,6 +165,10 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/admin") {
       return handleAdminGet(request, env, url);
+    }
+
+    if (request.method === "GET" && url.pathname === "/admin/sent") {
+      return handleSentDms(request, env, url);
     }
 
     if (request.method === "GET" && url.pathname === "/admin/connection") {
@@ -300,7 +309,7 @@ async function processCommentEvent(event: CommentEvent, env: AppEnv): Promise<vo
     return;
   }
 
-  const rule = await findMatchingRule(env.DB, event.text, env);
+  const rule = await findMatchingRule(env.DB, event.text, "comments", env);
   if (!rule) {
     await updateStatus(env.DB, event.commentId, "ignored_no_keyword", false, null);
     return;
@@ -487,7 +496,8 @@ async function processMessageEvent(event: DmEvent, env: AppEnv): Promise<void> {
   }
 
   // Priority: a starter tap, then a matching story rule (a paused one blocks
-  // everything below it), then a keyword typed in the DM, then the ig.me link.
+  // everything below it), then a keyword automation listening on this channel
+  // (DMs or story replies), then the ig.me link.
   const starterReply = parseReplyPayload(event.quickReplyPayload);
   const storyRule = starterReply ? null : matchStoryRule(event, settings.storyRules);
   let replyKey: string | null;
@@ -501,9 +511,8 @@ async function processMessageEvent(event: DmEvent, env: AppEnv): Promise<void> {
     paused = !storyRule.enabled;
     pausedLabel = storyRule.label;
   } else {
-    const keywordRule = event.kind === "message" && settings.keywordRepliesEnabled
-      ? await findDmKeywordRule(env.DB, event.text)
-      : null;
+    const channel = messageChannel(event);
+    const keywordRule = channel ? await findMatchingRule(env.DB, event.text, channel, env) : null;
     replyKey = keywordRule ? ruleReplyKey(keywordRule.id) : parseReplyRef(event.referralRef)?.reply ?? null;
   }
 
@@ -542,17 +551,12 @@ async function processMessageEvent(event: DmEvent, env: AppEnv): Promise<void> {
   }
 }
 
-// DM keyword replies use whole words, so "guide?" matches GUIDE but "guidelines" does not.
-async function findDmKeywordRule(db: D1Database, text: string): Promise<Rule | null> {
-  if (!text.trim()) {
-    return null;
-  }
-  for (const rule of await getRules(db, true)) {
-    if (rule.keywords.some((keyword) => matchesWholeWord(text, keyword))) {
-      return rule;
-    }
-  }
-  return null;
+// Typed messages (including one sent from an ig.me link) can match automations
+// listening on DMs, and replies to a story those listening on story replies.
+// Starter taps, button postbacks, link opens and story mentions never do.
+function messageChannel(event: DmEvent): Channel | null {
+  if (event.kind !== "message" || event.source === "story_mention") return null;
+  return event.source === "story_reply" ? "stories" : "dms";
 }
 
 async function resolveReply(db: D1Database, key: string, settings: DmFeatureSettings): Promise<ResolvedReply | null> {
@@ -725,9 +729,14 @@ async function updateStatus(
     .run();
 }
 
-async function findMatchingRule(db: D1Database, text: string, env: AppEnv): Promise<MatchedRule | null> {
-  const activeRules = await getRules(db, true);
+// The first active automation listening on the channel whose keyword the text
+// basically is (see src/keyword-match.ts). Comments fall back to the KEYWORD rule.
+async function findMatchingRule(db: D1Database, text: string, channel: Channel, env: AppEnv): Promise<MatchedRule | null> {
+  if (!text.trim()) {
+    return null;
+  }
 
+  const activeRules = (await getRules(db, true)).filter((rule) => rule.channels.includes(channel));
   for (const rule of activeRules) {
     const matchedKeyword = findMatchedKeyword(text, rule.keywords);
     if (matchedKeyword) {
@@ -735,8 +744,8 @@ async function findMatchingRule(db: D1Database, text: string, env: AppEnv): Prom
     }
   }
 
-  const fallback = getFallbackRule(env);
-  if (!fallback || !matchesKeyword(text, fallback.keywords[0])) {
+  const fallback = channel === "comments" ? getFallbackRule(env) : null;
+  if (!fallback || !isBasicallyKeyword(text, fallback.keywords[0])) {
     return null;
   }
 
@@ -744,7 +753,7 @@ async function findMatchingRule(db: D1Database, text: string, env: AppEnv): Prom
 }
 
 // The KEYWORD and PRIVATE_REPLY_TEXT vars in wrangler.jsonc act as one extra rule
-// (id 0) that applies when no dashboard rule matches.
+// (id 0) that applies to comments when no dashboard rule matches.
 function getFallbackRule(env: AppEnv): Rule | null {
   const fallbackKeyword = env.KEYWORD?.trim();
   if (!fallbackKeyword) {
@@ -754,6 +763,7 @@ function getFallbackRule(env: AppEnv): Rule | null {
   return {
     id: FALLBACK_RULE_ID,
     label: "Fallback rule",
+    channels: ["comments"],
     keywords: [fallbackKeyword],
     replyText: env.PRIVATE_REPLY_TEXT ?? "Thanks for commenting.",
     publicReplyText: null,
@@ -872,13 +882,14 @@ async function handleAdminGet(request: Request, env: AppEnv, url: URL): Promise<
   }
 
   const filters = parseActivityFilters(url);
-  const [rules, recentEvents, messageEvents, stats, connection, dmFeatures] = await Promise.all([
+  const [rules, recentEvents, messageEvents, stats, connection, dmFeatures, sentDms] = await Promise.all([
     getRules(env.DB, false),
     getRecentEvents(env.DB, filters),
     getRecentMessageEvents(env.DB),
     getDashboardStats(env.DB),
     getConnectionStatus(env),
-    getDmFeatureSettings(env.DB)
+    getDmFeatureSettings(env.DB),
+    getSentDms(env.DB, 5)
   ]);
   const [replyStats, publication] = await Promise.all([
     getReplyStats(env.DB, rules, dmFeatures),
@@ -891,16 +902,38 @@ async function handleAdminGet(request: Request, env: AppEnv, url: URL): Promise<
     rules,
     recentEvents,
     messageEvents,
+    recentDms: sentDms,
     replyStats,
     stats,
     connection,
     dmFeatures,
     publication,
-    // Shown in the sidebar and used for DM links: the verified account name, or OWNER_IG_USERNAME.
-    accountUsername: connection.username ?? (env.OWNER_IG_USERNAME?.trim().replace(/^@/, "") || null),
+    // Shown in the overview and used for DM links: the verified account name, or OWNER_IG_USERNAME.
+    accountUsername: accountUsername(env, connection),
     filters,
     flash: url.searchParams.get("saved") === "1" ? "Saved." : null
   }));
+}
+
+function accountUsername(env: AppEnv, connection: InstagramTokenStatus): string | null {
+  return connection.username ?? (env.OWNER_IG_USERNAME?.trim().replace(/^@/, "") || null);
+}
+
+// Outgoing DMs only, newest first. `?format=json` returns rendered rows for the page's live updates.
+async function handleSentDms(request: Request, env: AppEnv, url: URL): Promise<Response> {
+  const wantsJson = url.searchParams.get("format") === "json";
+  if (!env.ADMIN_TOKEN) {
+    return wantsJson ? json({ ok: false, error: "Set ADMIN_TOKEN first." }, 503) : html(renderMissingAdminTokenPage(), 503);
+  }
+  if (!(await isAdminRequest(request, env))) {
+    return wantsJson ? json({ ok: false, error: "Login required." }, 401) : redirect("/admin");
+  }
+
+  const [rows, summary] = await Promise.all([getSentDms(env.DB), getSentDmSummary(env.DB, new Date())]);
+  if (wantsJson) {
+    return json({ rows: renderSentRows(rows), summary: renderSentSummary(summary) });
+  }
+  return html(renderSentDmsPage({ rows, summary, dryRun: isDryRun(env) }));
 }
 
 async function handleDmFeatureSettings(request: Request, env: AppEnv, path: string): Promise<Response> {
@@ -1049,19 +1082,24 @@ async function handleCreateRule(request: Request, env: AppEnv): Promise<Response
   }
 
   const form = await request.formData();
-  const parsed = parseRuleForm(form);
+  const parsed = parseRuleForm(form, ["comments"]);
   if (!parsed.ok) {
     return html(renderErrorPage(parsed.error), 400);
+  }
+  const conflict = await findKeywordConflict(env.DB, parsed.rule, null);
+  if (conflict) {
+    return html(renderErrorPage(conflict), 400);
   }
 
   const now = new Date().toISOString();
   await env.DB.prepare(
     `INSERT INTO rules
-       (label, keywords, reply_text, public_reply_text, link_url, link_button_label, active, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (label, channels, keywords, reply_text, public_reply_text, link_url, link_button_label, active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       parsed.rule.label,
+      JSON.stringify(parsed.rule.channels),
       JSON.stringify(parsed.rule.keywords),
       parsed.rule.replyText,
       parsed.rule.publicReplyText,
@@ -1094,7 +1132,17 @@ async function handleUpdateRule(request: Request, env: AppEnv, ruleId: number): 
     return redirect("/admin?saved=1");
   }
 
+  const existing = await getRuleById(env.DB, ruleId);
+  if (!existing) {
+    return html(renderErrorPage("That automation no longer exists."), 404);
+  }
+
   if (action === "toggle") {
+    // Turning a rule back on must not create two active rules sharing a keyword on a channel.
+    const conflict = existing.active ? null : await findKeywordConflict(env.DB, { ...existing, active: true }, ruleId);
+    if (conflict) {
+      return html(renderErrorPage(conflict), 400);
+    }
     await env.DB.prepare(
       "UPDATE rules SET active = CASE active WHEN 1 THEN 0 ELSE 1 END, updated_at = ? WHERE id = ?"
     )
@@ -1103,14 +1151,20 @@ async function handleUpdateRule(request: Request, env: AppEnv, ruleId: number): 
     return redirect("/admin?saved=1");
   }
 
-  const parsed = parseRuleForm(form);
+  // A form without the channel picker keeps the rule's current channels.
+  const parsed = parseRuleForm(form, existing.channels);
   if (!parsed.ok) {
     return html(renderErrorPage(parsed.error), 400);
+  }
+  const conflict = await findKeywordConflict(env.DB, parsed.rule, ruleId);
+  if (conflict) {
+    return html(renderErrorPage(conflict), 400);
   }
 
   await env.DB.prepare(
     `UPDATE rules
      SET label = ?,
+         channels = ?,
          keywords = ?,
          reply_text = ?,
          public_reply_text = ?,
@@ -1122,6 +1176,7 @@ async function handleUpdateRule(request: Request, env: AppEnv, ruleId: number): 
   )
     .bind(
       parsed.rule.label,
+      JSON.stringify(parsed.rule.channels),
       JSON.stringify(parsed.rule.keywords),
       parsed.rule.replyText,
       parsed.rule.publicReplyText,
@@ -1134,6 +1189,33 @@ async function handleUpdateRule(request: Request, env: AppEnv, ruleId: number): 
     .run();
 
   return redirect("/admin?saved=1");
+}
+
+const CHANNEL_NAMES: Record<Channel, string> = { comments: "comments", dms: "DMs", stories: "story replies" };
+
+/**
+ * Active rules are checked in order, so a keyword shared by two active rules on
+ * the same channel would leave the later one unable to fire. Paused rules may
+ * share a keyword; turning one on runs this check again.
+ */
+async function findKeywordConflict(
+  db: D1Database,
+  rule: Pick<Rule, "keywords" | "channels" | "active">,
+  ruleId: number | null
+): Promise<string | null> {
+  if (!rule.active) {
+    return null;
+  }
+  const wanted = new Set(rule.keywords.map((keyword) => keyword.trim().toLowerCase()));
+  for (const other of await getRules(db, true)) {
+    if (other.id === ruleId) continue;
+    const shared = rule.channels.filter((channel) => other.channels.includes(channel));
+    const taken = shared.length ? other.keywords.find((keyword) => wanted.has(keyword.trim().toLowerCase())) : undefined;
+    if (taken) {
+      return `${taken.toUpperCase()} is already used by “${other.label}” for ${shared.map((channel) => CHANNEL_NAMES[channel]).join(" and ")}. Pick a different keyword, or pause “${other.label}” first.`;
+    }
+  }
+  return null;
 }
 
 async function handleRetryEvent(request: Request, env: AppEnv, commentId: string): Promise<Response> {
@@ -1163,6 +1245,10 @@ async function handleRetryEvent(request: Request, env: AppEnv, commentId: string
 
   if (!rule.active) {
     return html(renderErrorPage("This rule is turned off. Turn it on before retrying."), 400);
+  }
+
+  if (!rule.channels.includes("comments")) {
+    return html(renderErrorPage("This automation no longer listens on comments, so the comment cannot be retried."), 400);
   }
 
   const originalKeyword = event.matched_keyword?.trim().toLowerCase();
@@ -1224,9 +1310,9 @@ function isRetryableStatus(status: string): boolean {
 
 async function getRules(db: D1Database, activeOnly: boolean): Promise<Rule[]> {
   const query = activeOnly
-    ? `SELECT id, label, keywords, reply_text, public_reply_text, link_url, link_button_label, active, created_at, updated_at
+    ? `SELECT id, label, channels, keywords, reply_text, public_reply_text, link_url, link_button_label, active, created_at, updated_at
        FROM rules WHERE active = 1 ORDER BY id ASC`
-    : `SELECT id, label, keywords, reply_text, public_reply_text, link_url, link_button_label, active, created_at, updated_at
+    : `SELECT id, label, channels, keywords, reply_text, public_reply_text, link_url, link_button_label, active, created_at, updated_at
        FROM rules ORDER BY id ASC`;
   const result = await db.prepare(query).all<RuleRow>();
   return result.results.map(rowToRule);
@@ -1234,7 +1320,7 @@ async function getRules(db: D1Database, activeOnly: boolean): Promise<Rule[]> {
 
 async function getRuleById(db: D1Database, ruleId: number): Promise<Rule | null> {
   const row = await db.prepare(
-    `SELECT id, label, keywords, reply_text, public_reply_text, link_url, link_button_label, active, created_at, updated_at
+    `SELECT id, label, channels, keywords, reply_text, public_reply_text, link_url, link_button_label, active, created_at, updated_at
      FROM rules
      WHERE id = ?`
   )
@@ -1421,6 +1507,7 @@ function rowToRule(row: RuleRow): Rule {
   return {
     id: row.id,
     label: row.label,
+    channels: parseStoredChannels(row.channels),
     keywords: parseStoredKeywords(row.keywords),
     replyText: row.reply_text,
     publicReplyText: row.public_reply_text,
@@ -1432,7 +1519,12 @@ function rowToRule(row: RuleRow): Rule {
   };
 }
 
-function parseRuleForm(form: FormData): { ok: true; rule: Omit<Rule, "id" | "createdAt" | "updatedAt"> } | { ok: false; error: string } {
+// The channel picker always submits `channels` (a hidden empty value plus each
+// checked box). A submission without the field at all uses `defaultChannels`.
+function parseRuleForm(
+  form: FormData,
+  defaultChannels: Channel[]
+): { ok: true; rule: Omit<Rule, "id" | "createdAt" | "updatedAt"> } | { ok: false; error: string } {
   const label = getFormString(form, "label").trim();
   const keywords = parseKeywordsInput(getFormString(form, "keywords"));
   const replyText = getFormString(form, "reply_text").trim();
@@ -1440,6 +1532,10 @@ function parseRuleForm(form: FormData): { ok: true; rule: Omit<Rule, "id" | "cre
   const linkUrl = nullableTrim(getFormString(form, "link_url"));
   const linkButtonLabel = nullableTrim(getFormString(form, "link_button_label"));
   const active = form.get("active") === "on";
+  const submittedChannels = form.getAll("channels").map(String);
+  const channels = form.has("channels")
+    ? CHANNELS.filter((channel) => submittedChannels.includes(channel))
+    : [...defaultChannels];
 
   if (!label) {
     return { ok: false, error: "Rule label is required." };
@@ -1447,6 +1543,15 @@ function parseRuleForm(form: FormData): { ok: true; rule: Omit<Rule, "id" | "cre
 
   if (keywords.length === 0) {
     return { ok: false, error: "Add at least one keyword." };
+  }
+
+  const unusable = keywords.find((keyword) => !isBasicallyKeyword(keyword, keyword));
+  if (unusable) {
+    return { ok: false, error: `“${unusable}” can never match. Keywords need a letter or number and at most eight words.` };
+  }
+
+  if (channels.length === 0) {
+    return { ok: false, error: "Choose where the automation listens: comments, DMs, or story replies." };
   }
 
   if (!replyText) {
@@ -1470,8 +1575,8 @@ function parseRuleForm(form: FormData): { ok: true; rule: Omit<Rule, "id" | "cre
     return {
       ok: false,
       error: linkUrl
-        ? "With a link button, the DM text must be 640 characters or fewer."
-        : "DM text must be 1,000 characters or fewer."
+        ? `Keep the DM message to 640 characters when it has a button. That’s Instagram’s limit (this one has ${replyText.length.toLocaleString("en-US")}).`
+        : `Keep the DM message to 1,000 characters. That’s Instagram’s limit (this one has ${replyText.length.toLocaleString("en-US")}).`
     };
   }
 
@@ -1482,7 +1587,7 @@ function parseRuleForm(form: FormData): { ok: true; rule: Omit<Rule, "id" | "cre
     return { ok: false, error: "Each public reply must be 2,200 characters or fewer, with 10,000 characters in total." };
   }
 
-  return { ok: true, rule: { label, keywords, replyText, publicReplyText, linkUrl, linkButtonLabel, active } };
+  return { ok: true, rule: { label, channels, keywords, replyText, publicReplyText, linkUrl, linkButtonLabel, active } };
 }
 
 function nullableTrim(value: string): string | null {
@@ -1515,6 +1620,12 @@ function parseKeywordsInput(input: string): string[] {
   return keywords;
 }
 
+function parseStoredChannels(value: string | null): Channel[] {
+  const parsed = value ? parseJsonText(value) : null;
+  const channels = Array.isArray(parsed) ? CHANNELS.filter((channel) => parsed.includes(channel)) : [];
+  return channels.length ? channels : ["comments"];
+}
+
 function parseStoredKeywords(value: string): string[] {
   const parsed = parseJsonText(value);
   if (Array.isArray(parsed)) {
@@ -1524,12 +1635,7 @@ function parseStoredKeywords(value: string): string[] {
 }
 
 function findMatchedKeyword(text: string, keywords: string[]): string | null {
-  for (const keyword of keywords) {
-    if (matchesKeyword(text, keyword)) {
-      return keyword;
-    }
-  }
-  return null;
+  return keywords.find((keyword) => isBasicallyKeyword(text, keyword)) ?? null;
 }
 
 function extractCommentEvents(payload: unknown): CommentEvent[] {
@@ -1560,11 +1666,6 @@ function extractCommentEvents(payload: unknown): CommentEvent[] {
   }
 
   return events;
-}
-
-function matchesKeyword(text: string, keyword: string): boolean {
-  const trimmedKeyword = keyword.trim().toLowerCase();
-  return trimmedKeyword.length > 0 && text.toLowerCase().includes(trimmedKeyword);
 }
 
 // The account's own comments (including the public replies this Worker posts)

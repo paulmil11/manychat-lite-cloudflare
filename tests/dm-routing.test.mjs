@@ -3,16 +3,18 @@ import { after, before, test } from "node:test";
 import { buildWorker, createHarness } from "./worker-harness.mjs";
 
 // Signed DM webhooks through the real Worker: starters, story replies, DM links,
-// DM keyword replies and follower checks. Every Meta request is mocked.
+// automations that listen on DMs and follower checks. Every Meta request is mocked.
 const OWNER = "900000000000001";
 const READER = "900000000000002";
 const GUIDE = "rule-2";
 const WORKSHOP = "rule-3";
 const ASK = "text-ask";
+// Both automations answer comments and DMs, but not story replies.
 const RULES = [
   { label: "Free guide", keywords: '["GUIDE"]', reply_text: "Here is the free guide.", link_url: "https://example.com/guide", link_button_label: "Open guide" },
   { label: "Workshop waitlist", keywords: '["WORKSHOP"]', reply_text: "Join the workshop waitlist.", link_url: "https://example.com/workshop", link_button_label: "Join waitlist" },
 ];
+const COMMENTS_AND_DMS = '["comments","dms"]';
 
 let built;
 before(async () => { built = await buildWorker(); });
@@ -37,8 +39,8 @@ async function fixture(t, overrides = {}, featureOverrides = {}) {
   t.after(() => h.dispose());
   const now = new Date().toISOString();
   for (const rule of RULES) {
-    await h.db.prepare(`INSERT INTO rules (label, keywords, reply_text, link_url, link_button_label, active, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 1, ?, ?)`).bind(rule.label, rule.keywords, rule.reply_text, rule.link_url, rule.link_button_label, now, now).run();
+    await h.db.prepare(`INSERT INTO rules (label, channels, keywords, reply_text, link_url, link_button_label, active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`).bind(rule.label, COMMENTS_AND_DMS, rule.keywords, rule.reply_text, rule.link_url, rule.link_button_label, now, now).run();
   }
   assert.deepEqual(h.queryAll("SELECT id FROM rules WHERE active = 1 ORDER BY id").map((row) => `rule-${row.id}`), [GUIDE, WORKSHOP]);
   await setSettings(h, featureOverrides);
@@ -137,7 +139,7 @@ test("story ID and sticker-link rules take priority over keyword-only story rule
 });
 
 test("a paused matching story rule blocks DM keywords and broader story rules", async (t) => {
-  const h = await fixture(t, {}, { keywordRepliesEnabled: true, storyRules: [
+  const h = await fixture(t, {}, { storyRules: [
     { id: "generic", label: "Any GUIDE reply", storyId: "", storyUrl: "", keyword: "GUIDE", reply: GUIDE, enabled: true },
     { id: "paused", label: "Paused story", storyId: "12345", storyUrl: "", keyword: "", reply: WORKSHOP, enabled: false },
   ] });
@@ -161,7 +163,7 @@ test("story mentions without text can match a configured URL without fetching st
 
 test("DM links work in each webhook shape, and starters and DM keywords win over a link", async (t) => {
   const h = await fixture(t, {}, {
-    followerCheckEnabled: true, keywordRepliesEnabled: true, startersEnabled: true,
+    followerCheckEnabled: true, startersEnabled: true,
     starters: [{ title: "Ask a question", reply: ASK }],
   });
   h.setResponder(profileResponder(true));
@@ -200,7 +202,7 @@ test("unknown referral sources, event types and reply keys cannot send", async (
 });
 
 test("stale, missing and future timestamps, echoes, deletions and wrong recipients never call Meta", async (t) => {
-  const h = await fixture(t, {}, { followerCheckEnabled: true, keywordRepliesEnabled: true });
+  const h = await fixture(t, {}, { followerCheckEnabled: true });
   const now = Date.now();
   const variants = [
     { timestamp: now - 25 * 60 * 60 * 1000 },
@@ -223,25 +225,28 @@ test("stale, missing and future timestamps, echoes, deletions and wrong recipien
   assert.equal(eventRow(h, "echo"), null, "Echoes are not recorded");
 });
 
-test("DM keyword replies are off by default and match whole words of active rules when on", async (t) => {
+test("DMs match automations that listen on DMs, with the same strict rule as comments", async (t) => {
   const h = await fixture(t);
-  await h.webhook(dm("keyword-off", "GUIDE please"));
-  assert.equal(eventRow(h, "keyword-off").status, "ignored_no_match");
-  assert.equal(h.calls.length, 0);
-  await setSettings(h, { keywordRepliesEnabled: true });
-  await h.webhook(dm("keyword-on", "could you send the guide?"));
+  await h.webhook(dm("keyword-dm", "could you send the guide?"));
   assertReply(sentMessage(h), GUIDE);
-  assert.equal(eventRow(h, "keyword-on").reply_key, GUIDE);
+  assert.equal(eventRow(h, "keyword-dm").reply_key, GUIDE);
+  await h.webhook(dm("keyword-story", "GUIDE", { reply_to: { story: { id: "4242" } } }));
+  assert.equal(eventRow(h, "keyword-story").status, "ignored_no_match", "Story replies need the story replies channel");
   await h.webhook(dm("keyword-partial", "read the guidelines"));
   assert.equal(eventRow(h, "keyword-partial").status, "ignored_no_match");
+  await h.webhook(dm("keyword-chatter", "I loved your guide last week, thank you"));
+  assert.equal(eventRow(h, "keyword-chatter").status, "ignored_no_match");
   await h.db.prepare("UPDATE rules SET active = 0 WHERE label = 'Workshop waitlist'").run();
   await h.webhook(dm("keyword-inactive", "WORKSHOP"));
   assert.equal(eventRow(h, "keyword-inactive").status, "ignored_no_match");
+  await h.db.prepare(`UPDATE rules SET channels = '["comments"]' WHERE label = 'Free guide'`).run();
+  await h.webhook(dm("keyword-comments-only", "GUIDE"));
+  assert.equal(eventRow(h, "keyword-comments-only").status, "ignored_no_match", "A comments-only automation ignores DMs");
   assert.equal(sends(h).length, 1);
 });
 
 test("follower checks store true, false and unknown status and add only the matching opening line", async (t) => {
-  const h = await fixture(t, {}, { followerCheckEnabled: true, keywordRepliesEnabled: true, followerReply: "Thanks for following.", nonFollowerReply: "Welcome here." });
+  const h = await fixture(t, {}, { followerCheckEnabled: true, followerReply: "Thanks for following.", nonFollowerReply: "Welcome here." });
   const cases = [
     { state: true, stored: 1, greeting: "Thanks for following.", absent: "Welcome here." },
     { state: false, stored: 0, greeting: "Welcome here.", absent: "Thanks for following." },
@@ -273,7 +278,7 @@ test("follower checks store true, false and unknown status and add only the matc
 });
 
 test("a failed profile lookup still sends the reply and never counts as a non-follower", async (t) => {
-  const h = await fixture(t, {}, { followerCheckEnabled: true, keywordRepliesEnabled: true, followerReply: "Follower line", nonFollowerReply: "Non-follower line" });
+  const h = await fixture(t, {}, { followerCheckEnabled: true, followerReply: "Follower line", nonFollowerReply: "Non-follower line" });
   h.setResponder((call) => call.method === "GET"
     ? new Response(JSON.stringify({ error: { message: "User consent required", code: 10 } }), { status: 403 })
     : Response.json({ message_id: "sent" }));
@@ -289,7 +294,7 @@ test("a failed profile lookup still sends the reply and never counts as a non-fo
 test("an opening line is skipped when the reply would exceed Instagram's limit", async (t) => {
   const greeting = "g".repeat(80);
   const h = await fixture(t, {}, {
-    followerCheckEnabled: true, keywordRepliesEnabled: true, followerReply: greeting,
+    followerCheckEnabled: true, followerReply: greeting,
     customReplies: [{ id: "ask", label: "Ask a question", text: "a".repeat(990) }],
     storyRules: [{ id: "s", label: "Questions", storyId: "1", storyUrl: "", keyword: "", reply: ASK, enabled: true }],
   });
@@ -397,7 +402,7 @@ test("custom replies and rules cannot be deleted while a starter or story rule u
 
 test("test mode neither publishes starters nor looks up profiles nor sends DM replies", async (t) => {
   const h = await fixture(t, { DRY_RUN: "true" }, {
-    followerCheckEnabled: true, keywordRepliesEnabled: true, startersEnabled: true,
+    followerCheckEnabled: true, startersEnabled: true,
     starters: [{ title: "Get the guide", reply: GUIDE }],
     storyRules: [{ id: "s", label: "Story", storyId: "12345", storyUrl: "", keyword: "", reply: WORKSHOP, enabled: true }],
   });
@@ -433,7 +438,8 @@ test("publishing from the dashboard sends the saved starters and confirms them",
     { question: "Ask a question", payload: `DM_REPLY__${ASK}` },
   ]);
   const html = await (await h.request("/admin", { headers: { cookie } })).text();
-  assert.match(html, />Published</);
+  assert.match(html, />Live on Instagram</);
+  assert.match(html, /Last published <time/);
 });
 
 test("story URL rules match equivalent normalized URLs", async (t) => {
@@ -461,7 +467,7 @@ test("paused rules and paused starters block replies that point at them", async 
 });
 
 test("unknown postback payloads cannot route by their button title", async (t) => {
-  const h = await fixture(t, {}, { keywordRepliesEnabled: true });
+  const h = await fixture(t);
   await h.webhook(payload({ postback: { mid: "unknown-postback", title: "GUIDE", payload: "UNKNOWN_PAYLOAD" } }));
   assert.equal(sends(h).length, 0);
   assert.equal(eventRow(h, "unknown-postback").status, "ignored_no_match");
@@ -488,7 +494,7 @@ test("changes-style postback and referral webhooks route and deduplicate", async
 });
 
 test("profile cache database failures do not prevent a configured reply", async (t) => {
-  const h = await fixture(t, {}, { followerCheckEnabled: true, keywordRepliesEnabled: true, nonFollowerReply: "Do not add this for unknown status." });
+  const h = await fixture(t, {}, { followerCheckEnabled: true, nonFollowerReply: "Do not add this for unknown status." });
   const originalDatabase = h.env.DB;
   h.env.DB = {
     ...originalDatabase,
@@ -506,7 +512,7 @@ test("profile cache database failures do not prevent a configured reply", async 
 });
 
 test("the dashboard shows DM tools, DM links and escaped DM activity", async (t) => {
-  const h = await fixture(t, { DRY_RUN: "true" }, { keywordRepliesEnabled: true });
+  const h = await fixture(t, { DRY_RUN: "true" });
   const cookie = await h.login();
   const hostile = '<svg onload=alert(1)> GUIDE';
   await h.webhook(dm("unsafe-dm", hostile, { reply_to: { story: { id: "777", url: "https://cdn.example.test/s?a=1&b=<x>" } } }));

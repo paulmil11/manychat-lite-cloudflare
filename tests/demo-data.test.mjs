@@ -24,9 +24,10 @@ test("the local demo data loads after the migrations and fills every dashboard s
   const sql = await readFile("scripts/demo-data.sql", "utf8");
   await h.db.exec(sql);
   await h.db.exec(sql);
-  assert.equal(h.query("SELECT COUNT(*) AS count FROM rules WHERE id BETWEEN 101 AND 104").count, 4, "Re-running replaces the demo rows");
-  assert.equal(h.query("SELECT COUNT(*) AS count FROM comment_events").count, 8);
-  assert.equal(h.query("SELECT COUNT(*) AS count FROM message_events").count, 6);
+  assert.equal(h.query("SELECT COUNT(*) AS count FROM rules WHERE id BETWEEN 101 AND 105").count, 5, "Re-running replaces the demo rows");
+  assert.equal(h.query("SELECT COUNT(*) AS count FROM comment_events").count, 11);
+  assert.equal(h.query("SELECT COUNT(*) AS count FROM message_events").count, 9);
+  assert.deepEqual(JSON.parse(h.query("SELECT channels FROM rules WHERE id = 105").channels), ["dms", "stories"]);
   assert.equal(h.query("SELECT COUNT(*) AS count FROM instagram_tokens").count, 1);
 
   const cookie = await h.login();
@@ -43,13 +44,30 @@ test("the local demo data loads after the migrations and fills every dashboard s
 
   const html = await (await h.request("/admin", { headers: { cookie } })).text();
   for (const expected of [
-    "Free photo guide", "Lightroom presets", "Workshop waitlist", "Podcast episode",
-    "@demo_reader_1", "@demo_reader_10", "Conversation starter", "Story reply", "Link source: newsletter",
-    "Custom replies", "Collaborations", "Any story reply with GUIDE",
+    "Free photo guide", "Lightroom presets", "Workshop waitlist", "Podcast episode", "Photo walk sign-up",
+    "<span>DMs, Story replies</span>", "@demo_reader_1", "@demo_reader_10", "Conversation starter", "Story reply",
+    "Link source: newsletter", "Custom replies", "Collaborations", "Any story reply with GUIDE", "Not on Instagram yet",
     "https://ig.me/demo.creator?ref=rule-101__website", "@demo.creator", "Instagram connection",
   ]) {
     assert.ok(html.includes(expected), `Dashboard should show ${expected}`);
   }
+  const recent = html.match(/<div class="recent-dms">([\s\S]*?)<\/div>\s*<\/section>/)?.[1] ?? "";
+  assert.equal((recent.match(/<article class="dm-row"/g) ?? []).length, 5, "Recent DMs shows the latest five");
+  assert.match(recent, /replied to your story/);
+
+  // Comments that only mention a keyword in passing are not matches under the strict rule.
+  for (const id of ["demo-c9", "demo-c10"]) {
+    const row = h.query("SELECT comment_text, status FROM comment_events WHERE comment_id = ?", id);
+    assert.equal(row.status, "ignored_no_keyword", row.comment_text);
+  }
+
+  const sent = await (await h.request("/admin/sent", { headers: { cookie } })).text();
+  assert.match(sent, /replied to your story/);
+  assert.match(sent, /opened your DM link from newsletter/);
+  assert.match(sent, /inside “guidelines”/, "The older partial-word send is flagged");
+  assert.match(sent, /data-kind="dm" data-failed="1"/, "The failed DM is listed");
+  assert.match(sent, /<mark>WALK<\/mark>/, "A story reply answered by an automation highlights its keyword");
+  assert.doesNotMatch(sent, /demo_reader_14|demo_reader_15|demo_reader_19/, "Unmatched comments and DMs are not sent DMs");
   const connectionPanel = html.match(/<section id="connection"[\s\S]*?<\/section>/)?.[0] ?? "";
   assert.equal((connectionPanel.match(/<time /g) ?? []).length, 4, "Every connection date is filled");
   assert.equal(h.calls.length, 0, "Loading demo data never calls Instagram");
